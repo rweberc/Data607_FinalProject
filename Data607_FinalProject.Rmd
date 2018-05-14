@@ -1,0 +1,404 @@
+---
+title: "News Headline Comparisons"
+author: "Ryan Weber"
+date: "May 13, 2018"
+output: 
+  html_document:
+    theme: lumen
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(lubridate)
+library(tidytext)
+library(ggplot2)
+library(SnowballC)
+library(fuzzyjoin)
+library(tm)
+library(widyr)
+library(topicmodels)
+library(data.table)
+library(knitr)
+
+setwd("/Users/ryanweber/Desktop/CUNY/Data 607 Db/Final Project/")
+
+```
+
+### News website comparison
+
+<b>Primary question:</b> Using resources covered in this course, are there any quantifiable distinctions that can be made between information prioritized on sites across the political spectrum?  
+ - Fox News  
+ - CNN  
+ - MSNBC  
+
+### Example comparisons  
+  
+![https://newscompare.com/](/Users/ryanweber/Desktop/CUNY/Data 607 Db/Final Project/newscompare.png)  
+
+![https://www.vox.com/2018/5/8/17327246/fox-news-stormy-daniels-michael-cohen-data/](/Users/ryanweber/Desktop/CUNY/Data 607 Db/Final Project/voxcompare.png)  
+
+![https://www.allsides.com/unbiased-balanced-news/](/Users/ryanweber/Desktop/CUNY/Data 607 Db/Final Project/allsidescompare.png)  
+  
+  
+### Interested in what stories are prioritized in real-time  
+  
+#### <b>Approach:</b> 
+
+#### Take the top three headlines from MSNBC, CNN, and Fox News websites over four days and analyze the results (scraped from each site at 5-10 minute intervals).  
+  
+#### Compare against all headlines from these sites over the same time period to determine if there's any distinctions that can be found between the sites.  
+  
+#### Note, in this approach, since headlines are collected at 5-10 minute intervals throughout the day, if one headline stays up for a long time, this weighting will be reflected in the results, as it will appear one time in the data set for each time is was on a site when scraped.      
+  
+### Typical front pages  
+
+#### Fox news 
+"Kicker" elements precede each main headline, and may have a more emotional appeal than the article headlines themselves  
+
+![](/Users/ryanweber/Desktop/CUNY/Data 607 Db/Final Project/fox_ex.png) 
+  
+  
+#### CNN 
+Often one primary headline, then one or two additional featured stories  
+
+![](/Users/ryanweber/Desktop/CUNY/Data 607 Db/Final Project/cnn_ex.png) 
+
+#### MSNBC 
+List of headliness, each associated with large image associated with video or article  
+
+![](/Users/ryanweber/Desktop/CUNY/Data 607 Db/Final Project/msnbc_ex.png) 
+  
+
+```{r, include=FALSE}
+scraped <- read.csv("/Users/ryanweber/Desktop/CUNY/Data 607 Db/Final Project/cleanedHeadlines.csv", 
+                 stringsAsFactors = FALSE,
+                 colClasses = "character")
+
+  # Parse each headlines time
+  scraped$currentTime <- ymd_hms(scraped$currentTime)
+  
+  # Add several rows identifiers (rowNum, hourId, dayId)
+  scraped <- scraped %>%
+    ungroup() %>%
+    arrange(currentTime) %>%
+    mutate(hourId = floor_date(currentTime, unit = "1 hour"),
+           dayId = floor_date(currentTime, unit = "1 day"),
+           rowNum = row_number())
+  
+  # Only keep headlines that include intro text
+  scrapedDf <- scraped %>% filter(Field %in% c("kickerHeadline1", "kickerHeadline2", "kickerHeadline3"))
+  
+  # Keep clean headlines (no intro text)
+  scraped_reducedDf <- scraped %>% filter(Field %in% c("headline1", "headline2", "headline3"))
+```
+  
+```{r, include=FALSE}
+# Read in Google News Headlines
+  newsApiDf <- read.csv("/Users/ryanweber/Desktop/CUNY/Data 607 Db/Final Project/NewsApiHeadlines.csv", 
+                       stringsAsFactors = FALSE,
+                       colClasses = "character")
+  
+  newsApiDf <- newsApiDf %>%
+    rename(Text = title,
+           currentTime = publishedAt) %>%
+    select(-X)
+  
+  # Parse each headlines time
+  newsApiDf$currentTime <- ymd_hms(newsApiDf$currentTime)
+  
+  # Add several rows identifiers (rowNum, hourId, dayId)
+  newsApiDf <- newsApiDf %>%
+    ungroup() %>%
+    arrange(currentTime) %>%
+    mutate(hourId = floor_date(currentTime, unit = "1 hour"),
+           dayId = floor_date(currentTime, unit = "1 day"),
+           rowNum = row_number()) %>%
+    filter(currentTime < ymd("2018-05-13")) # to match timeframe for scraped results
+```
+
+```{r, include=FALSE}
+# Define some functions
+getTidyText <- function(df) {
+  df %>%
+    unnest_tokens(word, Text) %>%
+    anti_join(stop_words, by="word") %>%
+    mutate(word = wordStem(word)) %>%
+    group_by(site) %>%
+    mutate(totalSiteWords = n()) %>%
+    ungroup()
+}
+
+getWordFrequencies <- function(headlines) {
+  headlines %>%
+    ungroup() %>%
+    count(site, word) %>%
+    ungroup() %>%
+    group_by(site) %>%
+    top_n(n = 10, wt = n) %>%
+    ungroup() %>%
+    mutate(word = reorder(word, n)) %>%
+    ggplot(aes(word, n)) +
+    #geom_bar(stat = "identity") +
+    geom_col() +
+    facet_wrap(~site, ncol = 1, scales = "free") +
+    coord_flip()
+}
+
+getByHourPlot <- function(headlines) {
+  
+  headlinesSentiment_hour <- headlines %>%
+    inner_join(get_sentiments("bing"), by="word") %>%
+    count(site, index = hourId, sentiment) %>%
+    spread(sentiment, n, fill = 0) %>%
+    mutate(sentiment = positive - negative)
+
+  ggplot(headlinesSentiment_hour, aes(index, sentiment, fill = site)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~site, ncol = 1, scales = "free")
+}
+
+getByDayPlot <- function(headlines) {
+  headlinesSentiment_day <- headlines %>%
+    inner_join(get_sentiments("bing"), by="word") %>%
+    count(site, index = dayId, sentiment) %>%
+    spread(sentiment, n, fill = 0) %>%
+    mutate(sentiment = positive - negative)
+
+  ggplot(headlinesSentiment_day, aes(index, sentiment, fill = site)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~site, ncol = 1, scales = "free_x")
+}
+
+getPositiveSentiments <- function(headlines) {
+  headlines %>%
+  inner_join(get_sentiments("bing"), by="word") %>%
+  filter(sentiment == "positive") %>%
+  count(site, word, sentiment) %>%
+  group_by(site, sentiment) %>%
+  top_n(n = 10, wt = n) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  #geom_bar(stat = "identity") +
+  geom_col() +
+  facet_wrap(~site, ncol = 1, scales = "free") +
+  coord_flip() 
+}
+
+getNegativeSentiments <- function(headlines) {
+  headlines %>%
+  inner_join(get_sentiments("bing"), by="word") %>%
+  filter(sentiment == "negative") %>%
+  count(site, word, sentiment) %>%
+  group_by(site, sentiment) %>%
+  top_n(n = 10, wt = n) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  #geom_bar(stat = "identity") +
+  geom_col() +
+  facet_wrap(~site, ncol = 1, scales = "free") +
+  coord_flip() 
+}
+
+getTd_idf <- function(headlines) {
+  headlines %>% 
+    filter(word != "video") %>%
+    count(site, word) %>%
+    bind_tf_idf(word, site, n) %>%
+    arrange(desc(tf_idf)) %>%
+    group_by(site) %>%
+    top_n(10, tf_idf) %>%
+    ungroup() %>%
+    arrange(word, -tf_idf) %>%
+    mutate(word = reorder(word, tf_idf)) %>%
+    ggplot(aes(word, tf_idf, fill = factor(site))) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~ site, scales = "free") +
+    coord_flip()
+}
+```
+  
+  
+### Look at word frequencies  
+In coverage, "trump" is not surprisingly the most frequent headline word.  
+ - CNN may emphasize narratives regarding "giuliani" and "iran"  
+ - Fox has notable coverage of "rep" "waters".  
+ - MSNBC highlights coverage of "avenati".  
+  
+```{r, echo=FALSE}
+headlines <- getTidyText(scrapedDf)
+getWordFrequencies(headlines)
+```
+
+
+### Look sentiment by day
+```{r, echo=FALSE}
+getByDayPlot(headlines)
+```
+  
+### What is impacting this coverage primarily?
+```{r, echo=FALSE}
+getPositiveSentiments(headlines)
+```
+
+
+### After filtering out "trump", positive sentiments
+Associations seem reasonable  
+```{r, echo=FALSE}
+headlines <- headlines %>% filter(word != "trump")
+getPositiveSentiments(headlines)
+```
+  
+  
+### With "trump" filtered out, how have the by day sentiment differences changed
+Relative difference is largely similar, but now all stories are seen as primarily "negative" ("No news is good news".  
+```{r, echo=FALSE}
+getByDayPlot(headlines)
+```
+  
+
+### Sentiment differences by hour  
+Trend is less obvious  
+```{r, echo=FALSE}
+getByHourPlot(headlines)
+```  
+  
+  
+### Negative sentiments
+```{r, echo=FALSE}
+getNegativeSentiments(headlines)
+```
+  
+### What were the news stories on Saturday that were read as notably negative on CNN
+```{r, echo=FALSE}
+negDay <- scrapedDf %>%
+  filter(day(currentTime) == 12, 
+         site == "cnn",
+         str_detect(Field, "eadline")) %>%
+  fuzzy_inner_join(headlines %>%
+                     inner_join(get_sentiments("bing"), by="word") %>%
+                     filter(day(currentTime) == 12,
+                            site == "cnn",
+                            sentiment == "negative"),
+                   by = c("Text" = "word"), match_fun = str_detect) %>%
+  rename(site = site.x) %>%
+  #count(site, Text, word, sentiment)
+  select(Text, word) %>%
+  unique()
+
+kable(negDay)
+```
+
+#### In what sense are "attack" or "blow" up negative.  Perhaps if they appeal to a sense of fear in the reader.  
+
+#### In this sense, they seem appropriately classified in this data set to understand how the headlines may be operating on an emotional level.
+  
+### See which words are unique to each (tf-idf analysis)
+```{r, echo=FALSE}
+getTd_idf(headlines)
+```
+  
+Example of where some of these words are coming from
+```{r}
+kable(scrapedDf %>%
+  filter(site == "fox",
+         str_detect(str_to_lower(Text), "hillar")) %>%
+  count(Text))
+
+kable(scrapedDf %>%
+  filter(site == "fox",
+         str_detect(str_to_lower(Text), "maxine")) %>%
+  count(Text))
+
+kable(temp <- scrapedDf %>%
+  filter(site == "cnn",
+         str_detect(str_to_lower(Text), "product")) %>%
+  count(Text))
+
+kable(temp <- scrapedDf %>%
+  filter(site == "cnn",
+         str_detect(str_to_lower(Text), "world")) %>%
+  count(Text))
+
+kable(temp <- scrapedDf %>%
+  filter(site == "msnbc",
+         str_detect(str_to_lower(Text), "schneiderman")) %>%
+  count(Text))
+
+kable(temp <- scrapedDf %>%
+  filter(site == "msnbc",
+         str_detect(str_to_lower(Text), "pimp")) %>%
+  count(Text))
+```
+
+ - CNN seems to be only site emphasizing fire at Ford factory.  
+ - Fox emphasizes stories on Hillary and Maxine Waters, as well as having an emphasis on emotional words in this tf-idf collection ("slam", "fight", "resent", "outrage", "tasteless").  
+ - MSNBC places an emphasis on Mueller, Avenati, and, somewhat surprising for the 'liberal' site in this grouping,  notably covered the abuse scandals of the democrat Eric Schneiderman, who recently resigned as Attorney General of New York.  Looking at the results above, the majority of this coverage regarded it's relation to the Michael Cohen case, which this site emphasizes more than the others.
+ 
+### How do these results compare against the Google News Api results for the same sites over this time period?  
+
+Overall headlines  
+```{r, echo=FALSE}
+headlines_api <- getTidyText(newsApiDf) %>% filter(word != "trump")
+getWordFrequencies(headlines_api)
+```
+
+Top headlines  
+```{r, echo=FALSE}
+getWordFrequencies(headlines)
+```
+  
+#### Relatively similar, though as expected, single news items don't carry the same weight in the analysis.    
+
+#### For instance, "giuliani" does not have the same emphasis for CNN and Maxine "water"s does not have the same emphasis on Fox.  
+
+#### Similarly, "russia" is seen in the more general results on MSNBC, where as "probe" and "giuliani" are more common on the top headline results.  
+
+#### Notably, the number of available stories from the Google API for MSNBC over this time period was almost half of those available for the other two news outlets, perhaps explaining the closer similarity between the two results here.
+
+### Comparing the overall headline results from this period (against the top headlines results) for each site reveals a marked difference from the earlier results seen above:  
+
+Overall headlines  
+```{r, echo=FALSE}
+getByDayPlot(headlines_api)
+```
+
+Top story headlines  
+```{r, echo=FALSE}
+getByDayPlot(headlines)
+```
+
+#### In general, we can see that the top headlines looked to be much more negative.  
+  
+#### Also, the difference between CNN and Fox News that had been seen in the top headlines, does not appear to be present in the overall headlines for this time period.  
+  
+#### Further, we can see in the CNN results the outsized effect that one or two particular "negative" stories can have (Saturday for CNN) when weighting their effect for presence (as persisting top headlines on the website).
+
+### Though some distinctions in overall sentiment were observed, an attempt to categorize the headlines into three distinct groups using Document-Topic Probabilities, was not at all conclusive:  
+```{r, echo=FALSE}
+headlines_dtm <- headlines %>%
+  unite(document, site, hourId) %>%
+  count(document, word, sort = TRUE) %>%
+  ungroup()  %>% 
+  cast_dtm(document, word, n) 
+
+headlines_lda <- LDA(headlines_dtm, k = 3, control = list(seed = 12345))
+
+headlines_gamma <- tidy(headlines_lda, matrix = "gamma") %>%
+  separate(document, c("site", "hourId"), sep = "_", convert = TRUE)
+
+headlines_gamma %>% 
+  mutate(site = reorder(site, gamma * topic)) %>%
+  ggplot(aes(factor(topic), gamma)) +
+  geom_boxplot() +
+  facet_wrap(~ site)
+```
+
+  
